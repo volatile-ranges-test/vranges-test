@@ -1,6 +1,8 @@
 #!/bin/bash
 
 uid=`id -u`
+cgroupdir=/sys/fs/cgroup/memory
+testdir=test
 
 if [ $uid != 0 ]
 then
@@ -8,21 +10,21 @@ then
 	exit
 fi
 
-if [ ! -d /sys/fs/cgroup/memory ]
+if [ ! -d $cgroupdir ]
 then
 	echo "Non-standard cgroup configuration"
 	exit
 fi
 
-if [ ! -d /sys/fs/cgroup/memory/test ]
+if [ ! -d $cgroupdir/$testdir ]
 then
 	echo "Cgroups not setup"
 	exit
 fi
 
-for pid in `cat /sys/fs/cgroup/memory/test/tasks`
+for pid in `cat $cgroupdir/$testdir/tasks`
 do
-	echo $pid > /sys/fs/cgroup/memory/tasks
+	echo $pid > $cgroupdir/tasks
 done
 
-rmdir /sys/fs/cgroup/memory/test/
+rmdir $cgroupdir/$testdir

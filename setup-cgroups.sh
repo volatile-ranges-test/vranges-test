@@ -3,6 +3,8 @@
 
 user=$1
 uid=`id -u`
+cgroupdir=/sys/fs/cgroup/memory
+testdir=test
 
 if [ $uid != 0 ]
 then
@@ -10,13 +12,13 @@ then
 	exit
 fi
 
-if [ ! -d /sys/fs/cgroup/memory ]
+if [ ! -d $cgroupdir ]
 then
 	echo "Non-standard cgroup configuration"
 	exit
 fi
 
-mkdir /sys/fs/cgroup/memory/test
-echo 1M > /sys/fs/cgroup/memory/test/memory.limit_in_bytes
+mkdir $cgroupdir/$testdir
+echo 1M > $cgroupdir/$testdir/memory.limit_in_bytes
 
-chown -R $user /sys/fs/cgroup/memory/test 
+chown -R $user $cgroupdir/$testdir 
