@@ -13,3 +13,9 @@ cat /proc/self/cgroup | grep memory
 ./volatile-test
 ./volatile-test
 ./volatile-test
+
+./volatile-test-signal
+./volatile-test-signal
+./volatile-test-signal
+./volatile-test-signal
+./volatile-test-signal
