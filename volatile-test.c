@@ -83,12 +83,10 @@ int main(int argc, char *argv[])
 	int i, purged;
 	char* file;
 	int fd;
-	int is_file = 0;
 	if (argc > 1) {
 		file = argv[1];
 		fd = open(file, O_RDWR);
 		vaddr = mmap(0, FULLSIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-		is_file = 1;
 	} else {
 		is_anon = 1;
 		vaddr = malloc(FULLSIZE);
@@ -116,8 +114,7 @@ int main(int argc, char *argv[])
 //		printf("%c\n", vaddr[i*CHUNK]);
 
 	for(i=0; i < CHUNKNUM; ) {
-		int ret;
-		ret = mnovolatile(vaddr + (i*CHUNK), CHUNK, &purged);
+		mnovolatile(vaddr + (i*CHUNK), CHUNK, &purged);
 		i+=2;
 	}
 

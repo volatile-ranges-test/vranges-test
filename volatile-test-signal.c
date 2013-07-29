@@ -121,7 +121,6 @@ int main(int argc, char *argv[])
 	int i, purged;
 	char* file;
 	int fd;
-	int is_file = 0;
 	//signal(SIGBUS, signal_handler_sigbusy
 	//sigaction(SIGBUS, sigaction_sigbusy, NULL);
 	register_signal_handler();
@@ -129,7 +128,6 @@ int main(int argc, char *argv[])
 		file = argv[1];
 		fd = open(file, O_RDWR);
 		vaddr = mmap(0, FULLSIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-		is_file = 1;
 	} else {
 		is_anon = 1;
 		vaddr = malloc(FULLSIZE);
