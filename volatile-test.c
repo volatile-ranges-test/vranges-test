@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <stdlib.h>
 #include <string.h>
