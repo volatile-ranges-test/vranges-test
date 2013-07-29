@@ -42,7 +42,6 @@ static int mnovolatile(void *addr, size_t length, int* purged)
 
 
 char* vaddr;
-int is_anon = 0;
 #define PAGE_SIZE (4*1024)
 #define CHUNK (4*1024*4)
 #define CHUNKNUM 26
@@ -59,14 +58,6 @@ void generate_pressure(megs)
 
 
 	if (!child) {
-		if (is_anon) {
-			/* make sure we write to all the vrange pages
-			 *  in order to break the copy-on-write
-	 		 */
-			for(i=0; i < CHUNKNUM; i++)
-				memset(vaddr + (i*CHUNK), '0', CHUNK);
-		}
-
 		for (i=0; i < megs; i++) {
 			addr = malloc(one_meg);
 			bzero(addr, one_meg);		
@@ -88,7 +79,6 @@ int main(int argc, char *argv[])
 		fd = open(file, O_RDWR);
 		vaddr = mmap(0, FULLSIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	} else {
-		is_anon = 1;
 		vaddr = malloc(FULLSIZE);
 	}
 
