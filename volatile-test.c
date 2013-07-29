@@ -55,8 +55,6 @@ void generate_pressure(megs)
 	int i, status;
 
 	child = fork();
-
-
 	if (!child) {
 		for (i=0; i < megs; i++) {
 			addr = malloc(one_meg);
@@ -72,10 +70,30 @@ void generate_pressure(megs)
 int main(int argc, char *argv[])
 {
 	int i, purged;
-	char* file;
+	char* file = NULL;
 	int fd;
-	if (argc > 1) {
-		file = argv[1];
+	int pressure = 0;
+	int opt;
+
+        /* Process arguments */
+        while ((opt = getopt(argc, argv, "p:f:"))!=-1) {
+                switch(opt) {
+                case 'p':
+                        pressure = atoi(optarg);
+                        break;
+                case 'f':
+                        file = optarg;
+                        break;
+                default:
+                        printf("Usage: %s [-p <mempressure in megs>] [-f <filename>]\n", argv[0]);
+                        printf("        -p: Amount of memory pressure to generate\n");
+                        printf("        -f: Use a file\n");
+                        exit(-1);
+                }
+        }
+
+	if (file) {
+		printf("Using file %s\n", file);
 		fd = open(file, O_RDWR);
 		vaddr = mmap(0, FULLSIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	} else {
@@ -95,13 +113,8 @@ int main(int argc, char *argv[])
 		i+=2;
 	}
 
-//	for(i=0; i < CHUNKNUM; i++)
-//		printf("%c\n", vaddr[i*CHUNK]);
-
-	generate_pressure(3);
-
-//	for(i=0; i < CHUNKNUM; i++)
-//		printf("%c\n", vaddr[i*CHUNK]);
+	printf("Generating %i megs of pressure\n", pressure);
+	generate_pressure(pressure);
 
 	for(i=0; i < CHUNKNUM; ) {
 		mnovolatile(vaddr + (i*CHUNK), CHUNK, &purged);
@@ -110,6 +123,7 @@ int main(int argc, char *argv[])
 
 	if (purged)
 		printf("Data purged!\n");
+
 	for(i=0; i < CHUNKNUM; i++)
 		printf("%c\n", vaddr[i*CHUNK]);
 	
