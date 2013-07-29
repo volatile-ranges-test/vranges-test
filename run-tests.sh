@@ -5,17 +5,18 @@
 echo "Current cgroup"
 cat /proc/self/cgroup | grep memory
 
+PRESSURE=3
+
 #Just add your test here, we will figure out how to check the
 #results later on.
-./volatile-test
-./volatile-test
-./volatile-test
-./volatile-test
-./volatile-test
-./volatile-test
+./volatile-test -p $PRESSURE
+./volatile-test -p $PRESSURE
+./volatile-test -p $PRESSURE
+./volatile-test -p $PRESSURE
+./volatile-test -p $PRESSURE
 
-./volatile-test-signal
-./volatile-test-signal
-./volatile-test-signal
-./volatile-test-signal
-./volatile-test-signal
+./volatile-test-signal -p $PRESSURE
+./volatile-test-signal -p $PRESSURE
+./volatile-test-signal -p $PRESSURE
+./volatile-test-signal -p $PRESSURE
+./volatile-test-signal -p $PRESSURE
