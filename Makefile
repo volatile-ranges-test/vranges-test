@@ -1,9 +1,13 @@
-CFLAGS=-g -Wall
+CFLAGS += -g -Wall -O3 -Wl,-no-as-needed
 
-all:	volatile-test volatile-test-signal
+bins = volatile-test volatile-test-signal
+testfile = test
 
-volatile-test:	volatile-test.c
-	${CC} ${CFLAGS} -o $@ $@.c
+all: ${bins}
 
-volatile-test-signal:	volatile-test-signal.c
-	${CC} ${CFLAGS} -o $@ $@.c
+testfile:
+	dd if=/dev/zero of=${testfile} bs=1M count=26
+
+clean:
+	rm -f ${bins} ${testfile}
+
