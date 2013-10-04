@@ -22,9 +22,9 @@ then
 	exit
 fi
 
-for pid in `cat $cgroupdir/$testdir/tasks`
+for pid in $(cat $cgroupdir/$testdir/tasks)
 do
-	echo $pid > $cgroupdir/tasks
+	exec echo $pid > $cgroupdir/tasks
 done
 
 rmdir $cgroupdir/$testdir
