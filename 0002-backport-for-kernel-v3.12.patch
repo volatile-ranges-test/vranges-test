@@ -1,0 +1,126 @@
+From 8a94ed2a32961db5f89012d909d2703c40eea627 Mon Sep 17 00:00:00 2001
+From: Minchan Kim <minchan@kernel.org>
+Date: Mon, 2 Dec 2013 15:29:12 +0900
+Subject: [PATCH 2/2] backport for kernel v3.12
+
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+---
+ src/arena.c     |  7 ++-----
+ src/chunk.c     | 14 ++++++++------
+ src/mvolatile.c | 38 +++++++++++++++++++++++++++++++++++---
+ 3 files changed, 45 insertions(+), 14 deletions(-)
+
+diff --git a/src/arena.c b/src/arena.c
+index 84a1235..c365072 100644
+--- a/src/arena.c
++++ b/src/arena.c
+@@ -484,11 +484,8 @@ arena_run_split_helper(arena_t *arena, arena_run_t *run, size_t size,
+ 	}
+ 
+ 	if (novolatile && flag_volatile != 0) {
+-		if (mnovolatile((void *) ((uintptr_t)chunk + (run_ind <<
+-		    LG_PAGE)), (need_pages << LG_PAGE)) != 0) {
+-			malloc_printf("<jemalloc>: mnovolatile() failure\n");
+-			abort();
+-		}
++		mnovolatile((void *) ((uintptr_t)chunk + (run_ind <<
++		    LG_PAGE)), (need_pages << LG_PAGE));
+ 		flag_volatile = 0;
+ 		flag_dirty = CHUNK_MAP_DIRTY;
+ 	}
+diff --git a/src/chunk.c b/src/chunk.c
+index 1e4686f..8b32c3a 100644
+--- a/src/chunk.c
++++ b/src/chunk.c
+@@ -120,10 +120,10 @@ chunk_recycle(extent_tree_t *chunks_szad, extent_tree_t *chunks_ad, size_t size,
+ 
+ 	if (node != NULL)
+ 		base_node_dealloc(node);
+-	if (config_volatile && mnovolatile(ret, size) != 0) {
+-		malloc_printf("<jemalloc>: mnovolatile() failure\n");
+-		abort();
+-	}
++
++	if (config_volatile)
++		mnovolatile(ret, size);
++
+ 	if (*zero) {
+ 		if (zeroed == false)
+ 			memset(ret, 0, size);
+@@ -221,8 +221,10 @@ chunk_record(extent_tree_t *chunks_szad, extent_tree_t *chunks_ad, void *chunk,
+ 	extent_node_t *xnode, *node, *prev, key;
+ 
+ 	if (config_volatile) {
+-		mvolatile(chunk, size);
+-		unzeroed = true;
++		if (!mvolatile(chunk, size))
++			unzeroed = true;
++		else
++			unzeroed = pages_purge(chunk, size);
+ 	} else
+ 		unzeroed = pages_purge(chunk, size);
+ 	VALGRIND_MAKE_MEM_NOACCESS(chunk, size);
+diff --git a/src/mvolatile.c b/src/mvolatile.c
+index e80ffb9..bf625ab 100644
+--- a/src/mvolatile.c
++++ b/src/mvolatile.c
+@@ -3,13 +3,35 @@
+ 
+ #define	HAVE_MVOLATILE
+ 
+-#define	SYS_mvolatile 313
++#define	SYS_vrange 314
++#define VRANGE_VOLATILE 0
++#define VRANGE_NOVOLATILE 1
++
+ int
+ mvolatile(void *addr, size_t length)
+ {
+ 
+ #ifdef HAVE_MVOLATILE
+-	return syscall(SYS_mvolatile, addr, length);
++	int dummy, err;
++	size_t ret = syscall(SYS_vrange, addr, length, VRANGE_VOLATILE,
++				&dummy);
++	if (ret == length)
++		return 0;
++
++	/*
++	 * vrange system call partly success, maybe out of memory
++	 * so let's cancel former range.
++	 */
++	if (ret > 0) {
++		do {
++			/* TODO: hate infinite loop */
++			err = syscall(SYS_vrange, addr, ret,
++					VRANGE_NOVOLATILE, &dummy);
++		} while (err < 0);
++	}
++
++	/* Failed */
++	return 1;
+ #else
+ 	return mprotect(addr, length, PROT_NONE);
+ #endif
+@@ -21,7 +43,17 @@ mnovolatile(void *addr, size_t length)
+ {
+ 
+ #ifdef HAVE_MVOLATILE
+-	return syscall(SYS_mnovolatile, addr, length);
++	size_t ret;
++	int purged, ret_purged = 0;
++
++	do {
++		/* TODO: hate infinite loop */
++		ret = syscall(SYS_vrange, addr, length, VRANGE_NOVOLATILE,
++				&purged);
++		if (purged)
++			ret_purged = 1;
++	} while (ret < 0);
++	return ret_purged;
+ #else
+ 	return mprotect(addr, length, PROT_READ|PROT_WRITE);
+ #endif
+-- 
+1.8.4.3
+

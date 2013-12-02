@@ -1,0 +1,978 @@
+From 5bd9193182b161667947c13998128366d0beae85 Mon Sep 17 00:00:00 2001
+From: Jason Evans <je@fb.com>
+Date: Mon, 2 Dec 2013 14:59:14 +0900
+Subject: [PATCH 1/2] Implement experimental mvolatile(2)/mnovolatile(2)
+ support.
+
+Use mvolatile(2)/mnovolatile(2) rather than madvise(2) as a low overhead
+way of informing the kernel that unused dirty pages can be recycled
+without harming the application.  There are rough spots in this
+patch with regard to missing configure tests, less than ideal
+abstraction of the new tri-state page run state (clean/dirty/volatile),
+and statistics counters having names that don't make as much sense in
+this new context.  Perhaps the most concerning implication of this patch
+in its current form is the lack of a mechanism to coalesce clean page
+runs with volatile page runs, which can result in artificial chunk
+fragmentation that could be removed if madvise(2) were in use.  In
+practice this fragmentation can waste some virtual memory (which has a
+non-zero kernel memory cost), as well as increasing malloc overhead due
+to having a higher number of physically backed chunk headers.  Solutions
+exist, but I'll leave that for later, should this patch have long term
+value.
+
+Signed-off-by: Jason Evans <je@fb.com>
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+---
+ Makefile.in                                      |   2 +-
+ include/jemalloc/internal/arena.h                |  75 ++++--
+ include/jemalloc/internal/jemalloc_internal.h.in |   5 +
+ include/jemalloc/internal/mvolatile.h            |  20 ++
+ src/arena.c                                      | 327 ++++++++++++++++-------
+ src/chunk.c                                      |  10 +-
+ src/mvolatile.c                                  |  28 ++
+ 7 files changed, 340 insertions(+), 127 deletions(-)
+ create mode 100644 include/jemalloc/internal/mvolatile.h
+ create mode 100644 src/mvolatile.c
+
+diff --git a/Makefile.in b/Makefile.in
+index 7481047..ab400d5 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -80,7 +80,7 @@ CSRCS := $(srcroot)src/jemalloc.c $(srcroot)src/arena.c $(srcroot)src/atomic.c \
+ 	$(srcroot)src/hash.c $(srcroot)src/huge.c $(srcroot)src/mb.c \
+ 	$(srcroot)src/mutex.c $(srcroot)src/prof.c $(srcroot)src/quarantine.c \
+ 	$(srcroot)src/rtree.c $(srcroot)src/stats.c $(srcroot)src/tcache.c \
+-	$(srcroot)src/util.c $(srcroot)src/tsd.c
++	$(srcroot)src/util.c $(srcroot)src/tsd.c $(srcroot)src/mvolatile.c
+ ifeq ($(enable_zone_allocator), 1)
+ CSRCS += $(srcroot)src/zone.c
+ endif
+diff --git a/include/jemalloc/internal/arena.h b/include/jemalloc/internal/arena.h
+index 8fdee93..fa984e2 100644
+--- a/include/jemalloc/internal/arena.h
++++ b/include/jemalloc/internal/arena.h
+@@ -111,6 +111,7 @@ struct arena_chunk_map_s {
+ 	 * s : run size
+ 	 * n : binind for size class; large objects set these to BININD_INVALID
+ 	 *     except for promoted allocations (see prof_promote)
++	 * v : volatile
+ 	 * x : don't care
+ 	 * - : 0
+ 	 * + : 1
+@@ -118,42 +119,43 @@ struct arena_chunk_map_s {
+ 	 * [dula] : bit unset
+ 	 *
+ 	 *   Unallocated (clean):
+-	 *     ssssssss ssssssss ssss++++ ++++du-a
++	 *     ssssssss ssssssss ssss++++ +++vdu-a
+ 	 *     xxxxxxxx xxxxxxxx xxxxxxxx xxxx-Uxx
+-	 *     ssssssss ssssssss ssss++++ ++++dU-a
++	 *     ssssssss ssssssss ssss++++ +++vdU-a
+ 	 *
+ 	 *   Unallocated (dirty):
+-	 *     ssssssss ssssssss ssss++++ ++++D--a
++	 *     ssssssss ssssssss ssss++++ +++VD--a
+ 	 *     xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+-	 *     ssssssss ssssssss ssss++++ ++++D--a
++	 *     ssssssss ssssssss ssss++++ +++VD--a
+ 	 *
+ 	 *   Small:
+-	 *     pppppppp pppppppp ppppnnnn nnnnd--A
+-	 *     pppppppp pppppppp ppppnnnn nnnn---A
+-	 *     pppppppp pppppppp ppppnnnn nnnnd--A
++	 *     pppppppp pppppppp ppppnnnn nnnvd--A
++	 *     pppppppp pppppppp ppppnnnn nnn----A
++	 *     pppppppp pppppppp ppppnnnn nnnvd--A
+ 	 *
+ 	 *   Large:
+-	 *     ssssssss ssssssss ssss++++ ++++D-LA
++	 *     ssssssss ssssssss ssss++++ +++vD-LA
+ 	 *     xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+-	 *     -------- -------- ----++++ ++++D-LA
++	 *     -------- -------- ----++++ +++vD-LA
+ 	 *
+ 	 *   Large (sampled, size <= PAGE):
+-	 *     ssssssss ssssssss ssssnnnn nnnnD-LA
++	 *     ssssssss ssssssss ssssnnnn nnnvD-LA
+ 	 *
+ 	 *   Large (not sampled, size == PAGE):
+-	 *     ssssssss ssssssss ssss++++ ++++D-LA
++	 *     ssssssss ssssssss ssss++++ +++vD-LA
+ 	 */
+ 	size_t				bits;
+-#define	CHUNK_MAP_BININD_SHIFT	4
+-#define	BININD_INVALID		((size_t)0xffU)
++#define	CHUNK_MAP_BININD_SHIFT	5
++#define	BININD_INVALID		((size_t)0x7fU)
+ /*     CHUNK_MAP_BININD_MASK == (BININD_INVALID << CHUNK_MAP_BININD_SHIFT) */
+-#define	CHUNK_MAP_BININD_MASK	((size_t)0xff0U)
++#define	CHUNK_MAP_BININD_MASK	((size_t)0xfe0U)
+ #define	CHUNK_MAP_BININD_INVALID CHUNK_MAP_BININD_MASK
+-#define	CHUNK_MAP_FLAGS_MASK	((size_t)0xcU)
+-#define	CHUNK_MAP_DIRTY		((size_t)0x8U)
+-#define	CHUNK_MAP_UNZEROED	((size_t)0x4U)
+-#define	CHUNK_MAP_LARGE		((size_t)0x2U)
+-#define	CHUNK_MAP_ALLOCATED	((size_t)0x1U)
++#define	CHUNK_MAP_FLAGS_MASK	((size_t)0x1cU)
++#define	CHUNK_MAP_VOLATILE	((size_t)0x10U)
++#define	CHUNK_MAP_DIRTY		((size_t)0x08U)
++#define	CHUNK_MAP_UNZEROED	((size_t)0x04U)
++#define	CHUNK_MAP_LARGE		((size_t)0x02U)
++#define	CHUNK_MAP_ALLOCATED	((size_t)0x01U)
+ #define	CHUNK_MAP_KEY		CHUNK_MAP_ALLOCATED
+ };
+ typedef rb_tree(arena_chunk_map_t) arena_avail_tree_t;
+@@ -174,11 +176,12 @@ struct arena_chunk_s {
+ 	size_t			nruns_avail;
+ 
+ 	/*
+-	 * Number of available run adjacencies.  Clean and dirty available runs
+-	 * are not coalesced, which causes virtual memory fragmentation.  The
+-	 * ratio of (nruns_avail-nruns_adjac):nruns_adjac is used for tracking
+-	 * this fragmentation.
+-	 * */
++	 * Number of available run adjacencies that purging could coalesce.
++	 * Clean and dirty available runs are not coalesced, which causes
++	 * virtual memory fragmentation.  The ratio of
++	 * (nruns_avail-nruns_adjac):nruns_adjac is used for tracking this
++	 * fragmentation.
++	 */
+ 	size_t			nruns_adjac;
+ 
+ 	/*
+@@ -447,6 +450,7 @@ size_t	arena_mapbits_unallocated_size_get(arena_chunk_t *chunk,
+ size_t	arena_mapbits_large_size_get(arena_chunk_t *chunk, size_t pageind);
+ size_t	arena_mapbits_small_runind_get(arena_chunk_t *chunk, size_t pageind);
+ size_t	arena_mapbits_binind_get(arena_chunk_t *chunk, size_t pageind);
++size_t	arena_mapbits_volatile_get(arena_chunk_t *chunk, size_t pageind);
+ size_t	arena_mapbits_dirty_get(arena_chunk_t *chunk, size_t pageind);
+ size_t	arena_mapbits_unzeroed_get(arena_chunk_t *chunk, size_t pageind);
+ size_t	arena_mapbits_large_get(arena_chunk_t *chunk, size_t pageind);
+@@ -549,6 +553,15 @@ arena_mapbits_binind_get(arena_chunk_t *chunk, size_t pageind)
+ }
+ 
+ JEMALLOC_ALWAYS_INLINE size_t
++arena_mapbits_volatile_get(arena_chunk_t *chunk, size_t pageind)
++{
++	size_t mapbits;
++
++	mapbits = arena_mapbits_get(chunk, pageind);
++	return (mapbits & CHUNK_MAP_VOLATILE);
++}
++
++JEMALLOC_ALWAYS_INLINE size_t
+ arena_mapbits_dirty_get(arena_chunk_t *chunk, size_t pageind)
+ {
+ 	size_t mapbits;
+@@ -593,7 +606,8 @@ arena_mapbits_unallocated_set(arena_chunk_t *chunk, size_t pageind, size_t size,
+ 	mapbitsp = arena_mapbitsp_get(chunk, pageind);
+ 	assert((size & PAGE_MASK) == 0);
+ 	assert((flags & ~CHUNK_MAP_FLAGS_MASK) == 0);
+-	assert((flags & (CHUNK_MAP_DIRTY|CHUNK_MAP_UNZEROED)) == flags);
++	assert((flags & (CHUNK_MAP_VOLATILE|CHUNK_MAP_DIRTY|CHUNK_MAP_UNZEROED))
++	    == flags);
+ 	*mapbitsp = size | CHUNK_MAP_BININD_INVALID | flags;
+ }
+ 
+@@ -618,7 +632,7 @@ arena_mapbits_large_set(arena_chunk_t *chunk, size_t pageind, size_t size,
+ 
+ 	mapbitsp = arena_mapbitsp_get(chunk, pageind);
+ 	assert((size & PAGE_MASK) == 0);
+-	assert((flags & CHUNK_MAP_DIRTY) == flags);
++	assert((flags & (CHUNK_MAP_VOLATILE|CHUNK_MAP_DIRTY)) == flags);
+ 	unzeroed = *mapbitsp & CHUNK_MAP_UNZEROED; /* Preserve unzeroed. */
+ 	*mapbitsp = size | CHUNK_MAP_BININD_INVALID | flags | unzeroed |
+ 	    CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+@@ -654,6 +668,15 @@ arena_mapbits_small_set(arena_chunk_t *chunk, size_t pageind, size_t runind,
+ }
+ 
+ JEMALLOC_ALWAYS_INLINE void
++arena_mapbits_volatile_set(arena_chunk_t *chunk, size_t pageind, size_t v)
++{
++	size_t *mapbitsp;
++
++	mapbitsp = arena_mapbitsp_get(chunk, pageind);
++	*mapbitsp = (*mapbitsp & ~CHUNK_MAP_UNZEROED) | v;
++}
++
++JEMALLOC_ALWAYS_INLINE void
+ arena_mapbits_unzeroed_set(arena_chunk_t *chunk, size_t pageind,
+     size_t unzeroed)
+ {
+diff --git a/include/jemalloc/internal/jemalloc_internal.h.in b/include/jemalloc/internal/jemalloc_internal.h.in
+index 6270a08..2ccb27f 100644
+--- a/include/jemalloc/internal/jemalloc_internal.h.in
++++ b/include/jemalloc/internal/jemalloc_internal.h.in
+@@ -172,6 +172,7 @@ static const bool config_valgrind =
+     false
+ #endif
+     ;
++static const bool config_volatile = true; /* XXX Actually configure. */
+ static const bool config_xmalloc =
+ #ifdef JEMALLOC_XMALLOC
+     true
+@@ -452,6 +453,7 @@ static const bool config_ivsalloc =
+ #define	JEMALLOC_VALGRIND_FREE(ptr, rzsize)
+ #endif
+ 
++#include "jemalloc/internal/mvolatile.h"
+ #include "jemalloc/internal/util.h"
+ #include "jemalloc/internal/atomic.h"
+ #include "jemalloc/internal/prng.h"
+@@ -478,6 +480,7 @@ static const bool config_ivsalloc =
+ /******************************************************************************/
+ #define JEMALLOC_H_STRUCTS
+ 
++#include "jemalloc/internal/mvolatile.h"
+ #include "jemalloc/internal/util.h"
+ #include "jemalloc/internal/atomic.h"
+ #include "jemalloc/internal/prng.h"
+@@ -548,6 +551,7 @@ void	jemalloc_prefork(void);
+ void	jemalloc_postfork_parent(void);
+ void	jemalloc_postfork_child(void);
+ 
++#include "jemalloc/internal/mvolatile.h"
+ #include "jemalloc/internal/util.h"
+ #include "jemalloc/internal/atomic.h"
+ #include "jemalloc/internal/prng.h"
+@@ -574,6 +578,7 @@ void	jemalloc_postfork_child(void);
+ /******************************************************************************/
+ #define JEMALLOC_H_INLINES
+ 
++#include "jemalloc/internal/mvolatile.h"
+ #include "jemalloc/internal/util.h"
+ #include "jemalloc/internal/atomic.h"
+ #include "jemalloc/internal/prng.h"
+diff --git a/include/jemalloc/internal/mvolatile.h b/include/jemalloc/internal/mvolatile.h
+new file mode 100644
+index 0000000..4b903d4
+--- /dev/null
++++ b/include/jemalloc/internal/mvolatile.h
+@@ -0,0 +1,20 @@
++/******************************************************************************/
++#ifdef JEMALLOC_H_TYPES
++
++#endif /* JEMALLOC_H_TYPES */
++/******************************************************************************/
++#ifdef JEMALLOC_H_STRUCTS
++
++#endif /* JEMALLOC_H_STRUCTS */
++/******************************************************************************/
++#ifdef JEMALLOC_H_EXTERNS
++
++int	mvolatile(void *addr, size_t length);
++int	mnovolatile(void *addr, size_t length);
++
++#endif /* JEMALLOC_H_EXTERNS */
++/******************************************************************************/
++#ifdef JEMALLOC_H_INLINES
++
++#endif /* JEMALLOC_H_INLINES */
++/******************************************************************************/
+diff --git a/src/arena.c b/src/arena.c
+index d79e035..84a1235 100644
+--- a/src/arena.c
++++ b/src/arena.c
+@@ -46,14 +46,19 @@ static void	arena_avail_insert(arena_t *arena, arena_chunk_t *chunk,
+ static void	arena_avail_remove(arena_t *arena, arena_chunk_t *chunk,
+     size_t pageind, size_t npages, bool maybe_adjac_pred,
+     bool maybe_adjac_succ);
++static void	arena_run_split_helper(arena_t *arena, arena_run_t *run,
++    size_t size, bool large, size_t binind, bool remove, bool zero,
++    bool novolatile);
+ static void	arena_run_split(arena_t *arena, arena_run_t *run, size_t size,
+-    bool large, size_t binind, bool zero);
++    bool large, size_t binind, bool zero, bool novolatile);
++static void	arena_run_init(arena_t *arena, arena_run_t *run, size_t size,
++    bool large, size_t binind, bool zero, bool novolatile);
+ static arena_chunk_t *arena_chunk_alloc(arena_t *arena);
+ static void	arena_chunk_dealloc(arena_t *arena, arena_chunk_t *chunk);
+ static arena_run_t	*arena_run_alloc_helper(arena_t *arena, size_t size,
+-    bool large, size_t binind, bool zero);
++    bool large, size_t binind, bool zero, bool novolatile);
+ static arena_run_t *arena_run_alloc(arena_t *arena, size_t size, bool large,
+-    size_t binind, bool zero);
++    size_t binind, bool zero, bool novolatile);
+ static arena_chunk_t	*chunks_dirty_iter_cb(arena_chunk_tree_t *tree,
+     arena_chunk_t *chunk, void *arg);
+ static void	arena_purge(arena_t *arena, bool all);
+@@ -212,7 +217,19 @@ arena_avail_adjac_pred(arena_chunk_t *chunk, size_t pageind)
+ 
+ 	if (pageind-1 < map_bias)
+ 		ret = false;
+-	else {
++	else if (config_volatile) {
++		size_t pred_volatile, this_volatile, pred_dirty, this_dirty;
++		if (arena_mapbits_allocated_get(chunk, pageind-1) != 0)
++			return (false);
++		pred_volatile = arena_mapbits_volatile_get(chunk, pageind-1);
++		this_volatile = arena_mapbits_volatile_get(chunk, pageind);
++		pred_dirty = arena_mapbits_dirty_get(chunk, pageind-1);
++		this_dirty = arena_mapbits_dirty_get(chunk, pageind);
++		if ((pred_volatile != 0 && this_dirty != 0) || (pred_dirty != 0
++		    && this_volatile != 0))
++			return (true);
++		return (false);
++	} else {
+ 		ret = (arena_mapbits_allocated_get(chunk, pageind-1) == 0);
+ 		assert(ret == false || arena_mapbits_dirty_get(chunk,
+ 		    pageind-1) != arena_mapbits_dirty_get(chunk, pageind));
+@@ -223,17 +240,33 @@ arena_avail_adjac_pred(arena_chunk_t *chunk, size_t pageind)
+ static inline bool
+ arena_avail_adjac_succ(arena_chunk_t *chunk, size_t pageind, size_t npages)
+ {
+-	bool ret;
+ 
+ 	if (pageind+npages == chunk_npages)
+-		ret = false;
+-	else {
++		return (false);
++	else if (config_volatile) {
++		size_t this_volatile, succ_volatile, this_dirty, succ_dirty;
++		assert(pageind+npages < chunk_npages);
++		if (arena_mapbits_allocated_get(chunk, pageind+npages) != 0)
++			return (false);
++		this_volatile = arena_mapbits_volatile_get(chunk, pageind);
++		succ_volatile = arena_mapbits_volatile_get(chunk,
++		    pageind+npages);
++		this_dirty = arena_mapbits_dirty_get(chunk, pageind);
++		succ_dirty = arena_mapbits_dirty_get(chunk, pageind+npages);
++		if ((this_volatile != 0 && succ_dirty != 0) || (this_dirty != 0
++		    && succ_volatile != 0))
++			return (true);
++		return (false);
++	} else {
++		bool ret;
+ 		assert(pageind+npages < chunk_npages);
++		assert(arena_mapbits_volatile_get(chunk, pageind) == 0);
++		assert(arena_mapbits_volatile_get(chunk, pageind+npages) == 0);
+ 		ret = (arena_mapbits_allocated_get(chunk, pageind+npages) == 0);
+ 		assert(ret == false || arena_mapbits_dirty_get(chunk, pageind)
+ 		    != arena_mapbits_dirty_get(chunk, pageind+npages));
++		return (ret);
+ 	}
+-	return (ret);
+ }
+ 
+ static inline bool
+@@ -381,62 +414,83 @@ arena_run_page_validate_zeroed(arena_chunk_t *chunk, size_t run_ind)
+ }
+ 
+ static void
+-arena_run_split(arena_t *arena, arena_run_t *run, size_t size, bool large,
+-    size_t binind, bool zero)
++arena_run_split_helper(arena_t *arena, arena_run_t *run, size_t size,
++    bool large, size_t binind, bool remove, bool zero, bool novolatile)
+ {
+ 	arena_chunk_t *chunk;
+-	size_t run_ind, total_pages, need_pages, rem_pages, i;
+-	size_t flag_dirty;
++	size_t run_ind, need_pages, i;
++	size_t flag_volatile, flag_dirty;
+ 
+ 	assert((large && binind == BININD_INVALID) || (large == false && binind
+ 	    != BININD_INVALID));
+ 
+ 	chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(run);
+ 	run_ind = (unsigned)(((uintptr_t)run - (uintptr_t)chunk) >> LG_PAGE);
++	flag_volatile = config_volatile ? arena_mapbits_volatile_get(chunk,
++	    run_ind) : 0;
+ 	flag_dirty = arena_mapbits_dirty_get(chunk, run_ind);
+-	total_pages = arena_mapbits_unallocated_size_get(chunk, run_ind) >>
+-	    LG_PAGE;
+-	assert(arena_mapbits_dirty_get(chunk, run_ind+total_pages-1) ==
+-	    flag_dirty);
+ 	need_pages = (size >> LG_PAGE);
+ 	assert(need_pages > 0);
+-	assert(need_pages <= total_pages);
+-	rem_pages = total_pages - need_pages;
+ 
+-	arena_avail_remove(arena, chunk, run_ind, total_pages, true, true);
+-	if (config_stats) {
+-		/*
+-		 * Update stats_cactive if nactive is crossing a chunk
+-		 * multiple.
+-		 */
+-		size_t cactive_diff = CHUNK_CEILING((arena->nactive +
+-		    need_pages) << LG_PAGE) - CHUNK_CEILING(arena->nactive <<
+-		    LG_PAGE);
+-		if (cactive_diff != 0)
+-			stats_cactive_add(cactive_diff);
+-	}
+-	arena->nactive += need_pages;
+-
+-	/* Keep track of trailing unused pages for later use. */
+-	if (rem_pages > 0) {
+-		if (flag_dirty != 0) {
+-			arena_mapbits_unallocated_set(chunk, run_ind+need_pages,
+-			    (rem_pages << LG_PAGE), CHUNK_MAP_DIRTY);
+-			arena_mapbits_unallocated_set(chunk,
+-			    run_ind+total_pages-1, (rem_pages << LG_PAGE),
+-			    CHUNK_MAP_DIRTY);
+-		} else {
+-			arena_mapbits_unallocated_set(chunk, run_ind+need_pages,
+-			    (rem_pages << LG_PAGE),
+-			    arena_mapbits_unzeroed_get(chunk,
+-			    run_ind+need_pages));
+-			arena_mapbits_unallocated_set(chunk,
+-			    run_ind+total_pages-1, (rem_pages << LG_PAGE),
+-			    arena_mapbits_unzeroed_get(chunk,
+-			    run_ind+total_pages-1));
++	if (remove) {
++		size_t total_pages, rem_pages;
++
++		total_pages = arena_mapbits_unallocated_size_get(chunk,
++		    run_ind) >> LG_PAGE;
++		assert((config_volatile ? arena_mapbits_volatile_get(chunk,
++		    run_ind+total_pages-1) : 0) == flag_volatile);
++		assert(arena_mapbits_dirty_get(chunk, run_ind+total_pages-1) ==
++		    flag_dirty);
++		assert(need_pages <= total_pages);
++		rem_pages = total_pages - need_pages;
++
++		arena_avail_remove(arena, chunk, run_ind, total_pages, true,
++		    true);
++		if (config_stats) {
++			/*
++			 * Update stats_cactive if nactive is crossing a chunk
++			 * multiple.
++			 */
++			size_t cactive_diff = CHUNK_CEILING((arena->nactive +
++			    need_pages) << LG_PAGE) -
++			    CHUNK_CEILING(arena->nactive << LG_PAGE);
++			if (cactive_diff != 0)
++				stats_cactive_add(cactive_diff);
+ 		}
+-		arena_avail_insert(arena, chunk, run_ind+need_pages, rem_pages,
+-		    false, true);
++		arena->nactive += need_pages;
++
++		/* Keep track of trailing unused pages for later use. */
++		if (rem_pages > 0) {
++			if ((flag_volatile|flag_dirty) != 0) {
++				arena_mapbits_unallocated_set(chunk,
++				    run_ind+need_pages, (rem_pages << LG_PAGE),
++				    (flag_volatile|flag_dirty));
++				arena_mapbits_unallocated_set(chunk,
++				    run_ind+total_pages-1, (rem_pages <<
++				    LG_PAGE), (flag_volatile|flag_dirty));
++			} else {
++				arena_mapbits_unallocated_set(chunk,
++				    run_ind+need_pages, (rem_pages << LG_PAGE),
++				    arena_mapbits_unzeroed_get(chunk,
++				    run_ind+need_pages));
++				arena_mapbits_unallocated_set(chunk,
++				    run_ind+total_pages-1, (rem_pages <<
++				    LG_PAGE), arena_mapbits_unzeroed_get(chunk,
++				    run_ind+total_pages-1));
++			}
++			arena_avail_insert(arena, chunk, run_ind+need_pages,
++			    rem_pages, false, true);
++		}
++	}
++
++	if (novolatile && flag_volatile != 0) {
++		if (mnovolatile((void *) ((uintptr_t)chunk + (run_ind <<
++		    LG_PAGE)), (need_pages << LG_PAGE)) != 0) {
++			malloc_printf("<jemalloc>: mnovolatile() failure\n");
++			abort();
++		}
++		flag_volatile = 0;
++		flag_dirty = CHUNK_MAP_DIRTY;
+ 	}
+ 
+ 	/*
+@@ -445,7 +499,7 @@ arena_run_split(arena_t *arena, arena_run_t *run, size_t size, bool large,
+ 	 */
+ 	if (large) {
+ 		if (zero) {
+-			if (flag_dirty == 0) {
++			if ((flag_volatile|flag_dirty) == 0) {
+ 				/*
+ 				 * The run is clean, so some pages may be
+ 				 * zeroed (i.e. never before touched).
+@@ -474,8 +528,9 @@ arena_run_split(arena_t *arena, arena_run_t *run, size_t size, bool large,
+ 		 * page (i.e. both statements set the same element).
+ 		 */
+ 		arena_mapbits_large_set(chunk, run_ind+need_pages-1, 0,
+-		    flag_dirty);
+-		arena_mapbits_large_set(chunk, run_ind, size, flag_dirty);
++		    (flag_volatile|flag_dirty));
++		arena_mapbits_large_set(chunk, run_ind, size,
++		    (flag_volatile|flag_dirty));
+ 	} else {
+ 		assert(zero == false);
+ 		/*
+@@ -513,6 +568,24 @@ arena_run_split(arena_t *arena, arena_run_t *run, size_t size, bool large,
+ 	    LG_PAGE)), (need_pages << LG_PAGE));
+ }
+ 
++static void
++arena_run_split(arena_t *arena, arena_run_t *run, size_t size, bool large,
++    size_t binind, bool zero, bool novolatile)
++{
++
++	arena_run_split_helper(arena, run, size, large, binind, true, zero,
++	    novolatile);
++}
++
++static void
++arena_run_init(arena_t *arena, arena_run_t *run, size_t size, bool large,
++    size_t binind, bool zero, bool novolatile)
++{
++
++	arena_run_split_helper(arena, run, size, large, binind, false, zero,
++	    novolatile);
++}
++
+ static arena_chunk_t *
+ arena_chunk_alloc(arena_t *arena)
+ {
+@@ -529,6 +602,8 @@ arena_chunk_alloc(arena_t *arena)
+ 		    arena_maxclass);
+ 		assert(arena_mapbits_unallocated_size_get(chunk,
+ 		    chunk_npages-1) == arena_maxclass);
++		assert(arena_mapbits_volatile_get(chunk, map_bias) ==
++		    arena_mapbits_volatile_get(chunk, chunk_npages-1));
+ 		assert(arena_mapbits_dirty_get(chunk, map_bias) ==
+ 		    arena_mapbits_dirty_get(chunk, chunk_npages-1));
+ 	} else {
+@@ -602,6 +677,8 @@ arena_chunk_dealloc(arena_t *arena, arena_chunk_t *chunk)
+ 	    arena_maxclass);
+ 	assert(arena_mapbits_unallocated_size_get(chunk, chunk_npages-1) ==
+ 	    arena_maxclass);
++	assert(arena_mapbits_volatile_get(chunk, map_bias) ==
++	    arena_mapbits_volatile_get(chunk, chunk_npages-1));
+ 	assert(arena_mapbits_dirty_get(chunk, map_bias) ==
+ 	    arena_mapbits_dirty_get(chunk, chunk_npages-1));
+ 
+@@ -627,7 +704,7 @@ arena_chunk_dealloc(arena_t *arena, arena_chunk_t *chunk)
+ 
+ static arena_run_t *
+ arena_run_alloc_helper(arena_t *arena, size_t size, bool large, size_t binind,
+-    bool zero)
++    bool zero, bool novolatile)
+ {
+ 	arena_run_t *run;
+ 	arena_chunk_map_t *mapelm, key;
+@@ -642,7 +719,8 @@ arena_run_alloc_helper(arena_t *arena, size_t size, bool large, size_t binind,
+ 
+ 		run = (arena_run_t *)((uintptr_t)run_chunk + (pageind <<
+ 		    LG_PAGE));
+-		arena_run_split(arena, run, size, large, binind, zero);
++		arena_run_split(arena, run, size, large, binind, zero,
++		    novolatile);
+ 		return (run);
+ 	}
+ 
+@@ -651,7 +729,7 @@ arena_run_alloc_helper(arena_t *arena, size_t size, bool large, size_t binind,
+ 
+ static arena_run_t *
+ arena_run_alloc(arena_t *arena, size_t size, bool large, size_t binind,
+-    bool zero)
++    bool zero, bool novolatile)
+ {
+ 	arena_chunk_t *chunk;
+ 	arena_run_t *run;
+@@ -662,7 +740,8 @@ arena_run_alloc(arena_t *arena, size_t size, bool large, size_t binind,
+ 	    != BININD_INVALID));
+ 
+ 	/* Search the arena's chunks for the lowest best fit. */
+-	run = arena_run_alloc_helper(arena, size, large, binind, zero);
++	run = arena_run_alloc_helper(arena, size, large, binind, zero,
++	    novolatile);
+ 	if (run != NULL)
+ 		return (run);
+ 
+@@ -672,7 +751,8 @@ arena_run_alloc(arena_t *arena, size_t size, bool large, size_t binind,
+ 	chunk = arena_chunk_alloc(arena);
+ 	if (chunk != NULL) {
+ 		run = (arena_run_t *)((uintptr_t)chunk + (map_bias << LG_PAGE));
+-		arena_run_split(arena, run, size, large, binind, zero);
++		arena_run_split(arena, run, size, large, binind, zero,
++		    novolatile);
+ 		return (run);
+ 	}
+ 
+@@ -681,7 +761,8 @@ arena_run_alloc(arena_t *arena, size_t size, bool large, size_t binind,
+ 	 * sufficient memory available while this one dropped arena->lock in
+ 	 * arena_chunk_alloc(), so search one more time.
+ 	 */
+-	return (arena_run_alloc_helper(arena, size, large, binind, zero));
++	return (arena_run_alloc_helper(arena, size, large, binind, zero,
++	    novolatile));
+ }
+ 
+ static inline void
+@@ -763,17 +844,22 @@ arena_chunk_purge(arena_t *arena, arena_chunk_t *chunk, bool all)
+ 
+ 			npages = run_size >> LG_PAGE;
+ 			assert(pageind + npages <= chunk_npages);
++			assert(arena_mapbits_volatile_get(chunk, pageind) ==
++			    arena_mapbits_volatile_get(chunk,
++			    pageind+npages-1));
+ 			assert(arena_mapbits_dirty_get(chunk, pageind) ==
+ 			    arena_mapbits_dirty_get(chunk, pageind+npages-1));
+ 
+-			if (arena_mapbits_dirty_get(chunk, pageind) != 0 &&
++			if ((config_volatile == false ||
++			    arena_mapbits_volatile_get(chunk, pageind) == 0) &&
++			    arena_mapbits_dirty_get(chunk, pageind) != 0 &&
+ 			    (all || arena_avail_adjac(chunk, pageind,
+ 			    npages))) {
+ 				arena_run_t *run = (arena_run_t *)((uintptr_t)
+ 				    chunk + (uintptr_t)(pageind << LG_PAGE));
+ 
+ 				arena_run_split(arena, run, run_size, true,
+-				    BININD_INVALID, false);
++				    BININD_INVALID, false, false);
+ 				/* Append to list for later processing. */
+ 				ql_elm_new(mapelm, u.ql_link);
+ 				ql_tail_insert(&mapelms, mapelm, u.ql_link);
+@@ -806,30 +892,42 @@ arena_chunk_purge(arena_t *arena, arena_chunk_t *chunk, bool all)
+ 		nmadvise = 0;
+ 	npurged = 0;
+ 	ql_foreach(mapelm, &mapelms, u.ql_link) {
+-		bool unzeroed;
+-		size_t flag_unzeroed, i;
+-
+ 		pageind = (((uintptr_t)mapelm - (uintptr_t)chunk->map) /
+ 		    sizeof(arena_chunk_map_t)) + map_bias;
+ 		npages = arena_mapbits_large_size_get(chunk, pageind) >>
+ 		    LG_PAGE;
+ 		assert(pageind + npages <= chunk_npages);
+-		unzeroed = pages_purge((void *)((uintptr_t)chunk + (pageind <<
+-		    LG_PAGE)), (npages << LG_PAGE));
+-		flag_unzeroed = unzeroed ? CHUNK_MAP_UNZEROED : 0;
+-		/*
+-		 * Set the unzeroed flag for all pages, now that pages_purge()
+-		 * has returned whether the pages were zeroed as a side effect
+-		 * of purging.  This chunk map modification is safe even though
+-		 * the arena mutex isn't currently owned by this thread,
+-		 * because the run is marked as allocated, thus protecting it
+-		 * from being modified by any other thread.  As long as these
+-		 * writes don't perturb the first and last elements'
+-		 * CHUNK_MAP_ALLOCATED bits, behavior is well defined.
+-		 */
+-		for (i = 0; i < npages; i++) {
+-			arena_mapbits_unzeroed_set(chunk, pageind+i,
+-			    flag_unzeroed);
++		if (config_volatile) {
++			if (mvolatile((void *)((uintptr_t)chunk + (pageind <<
++			    LG_PAGE)), (npages << LG_PAGE)) == 0) {
++				/* Mark run as volatile. */
++				arena_mapbits_volatile_set(chunk, pageind,
++				    CHUNK_MAP_VOLATILE);
++				arena_mapbits_volatile_set(chunk,
++				    pageind+npages-1, CHUNK_MAP_VOLATILE);
++			}
++		} else {
++			size_t i;
++			bool unzeroed = pages_purge((void *)((uintptr_t)chunk +
++			    (pageind << LG_PAGE)), (npages << LG_PAGE));
++			size_t flag_unzeroed = unzeroed ? CHUNK_MAP_UNZEROED
++			    : 0;
++			/*
++			 * Set the unzeroed flag for all pages, now that
++			 * pages_purge() has returned whether the pages were
++			 * zeroed as a side effect of purging.  This chunk map
++			 * modification is safe even though the arena mutex
++			 * isn't currently owned by this thread, because the
++			 * run is marked as allocated, thus protecting it from
++			 * being modified by any other thread.  As long as
++			 * these writes don't perturb the first and last
++			 * elements' CHUNK_MAP_ALLOCATED bits, behavior is well
++			 * defined.
++			 */
++			for (i = 0; i < npages; i++) {
++				arena_mapbits_unzeroed_set(chunk, pageind+i,
++				    flag_unzeroed);
++			}
+ 		}
+ 		npurged += npages;
+ 		if (config_stats)
+@@ -849,6 +947,7 @@ arena_chunk_purge(arena_t *arena, arena_chunk_t *chunk, bool all)
+ 		run = (arena_run_t *)((uintptr_t)chunk + (uintptr_t)(pageind <<
+ 		    LG_PAGE));
+ 		ql_remove(&mapelms, mapelm, u.ql_link);
++
+ 		arena_run_dalloc(arena, run, false, true);
+ 	}
+ 
+@@ -969,7 +1068,7 @@ static void
+ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ {
+ 	arena_chunk_t *chunk;
+-	size_t size, run_ind, run_pages, flag_dirty;
++	size_t size, run_ind, run_pages, flag_volatile, flag_dirty;
+ 
+ 	chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(run);
+ 	run_ind = (size_t)(((uintptr_t)run - (uintptr_t)chunk) >> LG_PAGE);
+@@ -998,6 +1097,8 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 	}
+ 	arena->nactive -= run_pages;
+ 
++	flag_volatile = config_volatile ? arena_mapbits_volatile_get(chunk,
++	    run_ind) : 0;
+ 	/*
+ 	 * The run is dirty if the caller claims to have dirtied it, as well as
+ 	 * if it was already dirty before being allocated and the caller
+@@ -1012,20 +1113,23 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 	/* Mark pages as unallocated in the chunk map. */
+ 	if (dirty) {
+ 		arena_mapbits_unallocated_set(chunk, run_ind, size,
+-		    CHUNK_MAP_DIRTY);
++		    (flag_volatile|flag_dirty));
+ 		arena_mapbits_unallocated_set(chunk, run_ind+run_pages-1, size,
+-		    CHUNK_MAP_DIRTY);
++		    (flag_volatile|flag_dirty));
+ 	} else {
+ 		arena_mapbits_unallocated_set(chunk, run_ind, size,
+-		    arena_mapbits_unzeroed_get(chunk, run_ind));
++		    (flag_volatile|arena_mapbits_unzeroed_get(chunk, run_ind)));
+ 		arena_mapbits_unallocated_set(chunk, run_ind+run_pages-1, size,
+-		    arena_mapbits_unzeroed_get(chunk, run_ind+run_pages-1));
++		    (flag_volatile|arena_mapbits_unzeroed_get(chunk,
++		    run_ind+run_pages-1)));
+ 	}
+ 
+ 	/* Try to coalesce forward. */
+ 	if (run_ind + run_pages < chunk_npages &&
+ 	    arena_mapbits_allocated_get(chunk, run_ind+run_pages) == 0 &&
+-	    arena_mapbits_dirty_get(chunk, run_ind+run_pages) == flag_dirty) {
++	    arena_mapbits_volatile_get(chunk, run_ind+run_pages) ==
++	    flag_volatile && arena_mapbits_dirty_get(chunk, run_ind+run_pages)
++	    == flag_dirty) {
+ 		size_t nrun_size = arena_mapbits_unallocated_size_get(chunk,
+ 		    run_ind+run_pages);
+ 		size_t nrun_pages = nrun_size >> LG_PAGE;
+@@ -1036,6 +1140,8 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 		 */
+ 		assert(arena_mapbits_unallocated_size_get(chunk,
+ 		    run_ind+run_pages+nrun_pages-1) == nrun_size);
++		assert(arena_mapbits_volatile_get(chunk,
++		    run_ind+run_pages+nrun_pages-1) == flag_volatile);
+ 		assert(arena_mapbits_dirty_get(chunk,
+ 		    run_ind+run_pages+nrun_pages-1) == flag_dirty);
+ 		arena_avail_remove(arena, chunk, run_ind+run_pages, nrun_pages,
+@@ -1051,7 +1157,9 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 
+ 	/* Try to coalesce backward. */
+ 	if (run_ind > map_bias && arena_mapbits_allocated_get(chunk, run_ind-1)
+-	    == 0 && arena_mapbits_dirty_get(chunk, run_ind-1) == flag_dirty) {
++	    == 0 && arena_mapbits_volatile_get(chunk, run_ind-1) ==
++	    flag_volatile && arena_mapbits_dirty_get(chunk, run_ind-1) ==
++	    flag_dirty) {
+ 		size_t prun_size = arena_mapbits_unallocated_size_get(chunk,
+ 		    run_ind-1);
+ 		size_t prun_pages = prun_size >> LG_PAGE;
+@@ -1064,6 +1172,8 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 		 */
+ 		assert(arena_mapbits_unallocated_size_get(chunk, run_ind) ==
+ 		    prun_size);
++		assert(arena_mapbits_volatile_get(chunk, run_ind) ==
++		    flag_volatile);
+ 		assert(arena_mapbits_dirty_get(chunk, run_ind) == flag_dirty);
+ 		arena_avail_remove(arena, chunk, run_ind, prun_pages, true,
+ 		    false);
+@@ -1079,6 +1189,8 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 	/* Insert into runs_avail, now that coalescing is complete. */
+ 	assert(arena_mapbits_unallocated_size_get(chunk, run_ind) ==
+ 	    arena_mapbits_unallocated_size_get(chunk, run_ind+run_pages-1));
++	assert(arena_mapbits_volatile_get(chunk, run_ind) ==
++	    arena_mapbits_volatile_get(chunk, run_ind+run_pages-1));
+ 	assert(arena_mapbits_dirty_get(chunk, run_ind) ==
+ 	    arena_mapbits_dirty_get(chunk, run_ind+run_pages-1));
+ 	arena_avail_insert(arena, chunk, run_ind, run_pages, true, true);
+@@ -1097,7 +1209,7 @@ arena_run_dalloc(arena_t *arena, arena_run_t *run, bool dirty, bool cleaned)
+ 	 * allows for an old spare to be fully deallocated, thus decreasing the
+ 	 * chances of spuriously crossing the dirty page purging threshold.
+ 	 */
+-	if (dirty)
++	if (dirty && flag_volatile == 0)
+ 		arena_maybe_purge(arena);
+ }
+ 
+@@ -1107,6 +1219,8 @@ arena_run_trim_head(arena_t *arena, arena_chunk_t *chunk, arena_run_t *run,
+ {
+ 	size_t pageind = ((uintptr_t)run - (uintptr_t)chunk) >> LG_PAGE;
+ 	size_t head_npages = (oldsize - newsize) >> LG_PAGE;
++	size_t flag_volatile = config_volatile ?
++	    arena_mapbits_volatile_get(chunk, pageind) : 0;
+ 	size_t flag_dirty = arena_mapbits_dirty_get(chunk, pageind);
+ 
+ 	assert(oldsize > newsize);
+@@ -1117,18 +1231,22 @@ arena_run_trim_head(arena_t *arena, arena_chunk_t *chunk, arena_run_t *run,
+ 	 * run first, in case of single-page runs.
+ 	 */
+ 	assert(arena_mapbits_large_size_get(chunk, pageind) == oldsize);
+-	arena_mapbits_large_set(chunk, pageind+head_npages-1, 0, flag_dirty);
+-	arena_mapbits_large_set(chunk, pageind, oldsize-newsize, flag_dirty);
++	arena_mapbits_large_set(chunk, pageind+head_npages-1, 0,
++	    (flag_volatile|flag_dirty));
++	arena_mapbits_large_set(chunk, pageind, oldsize-newsize,
++	    (flag_volatile|flag_dirty));
+ 
+ 	if (config_debug) {
+ 		UNUSED size_t tail_npages = newsize >> LG_PAGE;
+ 		assert(arena_mapbits_large_size_get(chunk,
+ 		    pageind+head_npages+tail_npages-1) == 0);
++		assert(arena_mapbits_volatile_get(chunk,
++		    pageind+head_npages+tail_npages-1) == flag_volatile);
+ 		assert(arena_mapbits_dirty_get(chunk,
+ 		    pageind+head_npages+tail_npages-1) == flag_dirty);
+ 	}
+ 	arena_mapbits_large_set(chunk, pageind+head_npages, newsize,
+-	    flag_dirty);
++	    (flag_volatile|flag_dirty));
+ 
+ 	arena_run_dalloc(arena, run, false, false);
+ }
+@@ -1139,6 +1257,8 @@ arena_run_trim_tail(arena_t *arena, arena_chunk_t *chunk, arena_run_t *run,
+ {
+ 	size_t pageind = ((uintptr_t)run - (uintptr_t)chunk) >> LG_PAGE;
+ 	size_t head_npages = newsize >> LG_PAGE;
++	size_t flag_volatile = config_volatile ?
++	    arena_mapbits_volatile_get(chunk, pageind) : 0;
+ 	size_t flag_dirty = arena_mapbits_dirty_get(chunk, pageind);
+ 
+ 	assert(oldsize > newsize);
+@@ -1149,18 +1269,22 @@ arena_run_trim_tail(arena_t *arena, arena_chunk_t *chunk, arena_run_t *run,
+ 	 * run first, in case of single-page runs.
+ 	 */
+ 	assert(arena_mapbits_large_size_get(chunk, pageind) == oldsize);
+-	arena_mapbits_large_set(chunk, pageind+head_npages-1, 0, flag_dirty);
+-	arena_mapbits_large_set(chunk, pageind, newsize, flag_dirty);
++	arena_mapbits_large_set(chunk, pageind+head_npages-1, 0,
++	    (flag_volatile|flag_dirty));
++	arena_mapbits_large_set(chunk, pageind, newsize,
++	    (flag_volatile|flag_dirty));
+ 
+ 	if (config_debug) {
+ 		UNUSED size_t tail_npages = (oldsize - newsize) >> LG_PAGE;
+ 		assert(arena_mapbits_large_size_get(chunk,
+ 		    pageind+head_npages+tail_npages-1) == 0);
++		assert(arena_mapbits_volatile_get(chunk,
++		    pageind+head_npages+tail_npages-1) == flag_volatile);
+ 		assert(arena_mapbits_dirty_get(chunk,
+ 		    pageind+head_npages+tail_npages-1) == flag_dirty);
+ 	}
+ 	arena_mapbits_large_set(chunk, pageind+head_npages, oldsize-newsize,
+-	    flag_dirty);
++	    (flag_volatile|flag_dirty));
+ 
+ 	arena_run_dalloc(arena, (arena_run_t *)((uintptr_t)run + newsize),
+ 	    dirty, false);
+@@ -1243,7 +1367,8 @@ arena_bin_nonfull_run_get(arena_t *arena, arena_bin_t *bin)
+ 	malloc_mutex_unlock(&bin->lock);
+ 	/******************************/
+ 	malloc_mutex_lock(&arena->lock);
+-	run = arena_run_alloc(arena, bin_info->run_size, false, binind, false);
++	run = arena_run_alloc(arena, bin_info->run_size, false, binind, false,
++	    true);
+ 	if (run != NULL) {
+ 		bitmap_t *bitmap = (bitmap_t *)((uintptr_t)run +
+ 		    (uintptr_t)bin_info->bitmap_offset);
+@@ -1479,7 +1604,8 @@ arena_malloc_large(arena_t *arena, size_t size, bool zero)
+ 	/* Large allocation. */
+ 	size = PAGE_CEILING(size);
+ 	malloc_mutex_lock(&arena->lock);
+-	ret = (void *)arena_run_alloc(arena, size, true, BININD_INVALID, zero);
++	ret = (void *)arena_run_alloc(arena, size, true, BININD_INVALID, zero,
++	    true);
+ 	if (ret == NULL) {
+ 		malloc_mutex_unlock(&arena->lock);
+ 		return (NULL);
+@@ -1523,7 +1649,8 @@ arena_palloc(arena_t *arena, size_t size, size_t alignment, bool zero)
+ 	alloc_size = size + alignment - PAGE;
+ 
+ 	malloc_mutex_lock(&arena->lock);
+-	run = arena_run_alloc(arena, alloc_size, true, BININD_INVALID, zero);
++	run = arena_run_alloc(arena, alloc_size, true, BININD_INVALID, false,
++	    false);
+ 	if (run == NULL) {
+ 		malloc_mutex_unlock(&arena->lock);
+ 		return (NULL);
+@@ -1543,6 +1670,8 @@ arena_palloc(arena_t *arena, size_t size, size_t alignment, bool zero)
+ 		arena_run_trim_tail(arena, chunk, ret, size + trailsize, size,
+ 		    false);
+ 	}
++	arena_run_init(arena, (arena_run_t *)ret, size, true, BININD_INVALID,
++	    zero, true);
+ 
+ 	if (config_stats) {
+ 		arena->stats.nmalloc_large++;
+@@ -1833,7 +1962,7 @@ arena_ralloc_large_grow(arena_t *arena, arena_chunk_t *chunk, void *ptr,
+ 		    ? followsize : size + extra - oldsize;
+ 		arena_run_split(arena, (arena_run_t *)((uintptr_t)chunk +
+ 		    ((pageind+npages) << LG_PAGE)), splitsize, true,
+-		    BININD_INVALID, zero);
++		    BININD_INVALID, zero, true);
+ 
+ 		size = oldsize + splitsize;
+ 		npages = size >> LG_PAGE;
+diff --git a/src/chunk.c b/src/chunk.c
+index 044f76b..1e4686f 100644
+--- a/src/chunk.c
++++ b/src/chunk.c
+@@ -120,6 +120,10 @@ chunk_recycle(extent_tree_t *chunks_szad, extent_tree_t *chunks_ad, size_t size,
+ 
+ 	if (node != NULL)
+ 		base_node_dealloc(node);
++	if (config_volatile && mnovolatile(ret, size) != 0) {
++		malloc_printf("<jemalloc>: mnovolatile() failure\n");
++		abort();
++	}
+ 	if (*zero) {
+ 		if (zeroed == false)
+ 			memset(ret, 0, size);
+@@ -216,7 +220,11 @@ chunk_record(extent_tree_t *chunks_szad, extent_tree_t *chunks_ad, void *chunk,
+ 	bool unzeroed;
+ 	extent_node_t *xnode, *node, *prev, key;
+ 
+-	unzeroed = pages_purge(chunk, size);
++	if (config_volatile) {
++		mvolatile(chunk, size);
++		unzeroed = true;
++	} else
++		unzeroed = pages_purge(chunk, size);
+ 	VALGRIND_MAKE_MEM_NOACCESS(chunk, size);
+ 
+ 	/*
+diff --git a/src/mvolatile.c b/src/mvolatile.c
+new file mode 100644
+index 0000000..e80ffb9
+--- /dev/null
++++ b/src/mvolatile.c
+@@ -0,0 +1,28 @@
++#include "jemalloc/internal/jemalloc_internal.h"
++#include <syscall.h>
++
++#define	HAVE_MVOLATILE
++
++#define	SYS_mvolatile 313
++int
++mvolatile(void *addr, size_t length)
++{
++
++#ifdef HAVE_MVOLATILE
++	return syscall(SYS_mvolatile, addr, length);
++#else
++	return mprotect(addr, length, PROT_NONE);
++#endif
++}
++
++#define SYS_mnovolatile 314
++int
++mnovolatile(void *addr, size_t length)
++{
++
++#ifdef HAVE_MVOLATILE
++	return syscall(SYS_mnovolatile, addr, length);
++#else
++	return mprotect(addr, length, PROT_READ|PROT_WRITE);
++#endif
++}
+-- 
+1.8.4.3
+
