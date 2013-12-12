@@ -100,7 +100,6 @@ int main(int argc, char *argv[])
 		vaddr = malloc(FULLSIZE);
 	}
 
-	purged = 0;
 	vaddr += PAGE_SIZE-1;
 	vaddr -= (long)vaddr % PAGE_SIZE;
 
@@ -116,8 +115,11 @@ int main(int argc, char *argv[])
 	printf("Generating %i megs of pressure\n", pressure);
 	generate_pressure(pressure);
 
+	purged = 0;
 	for(i=0; i < CHUNKNUM; ) {
-		mnovolatile(vaddr + (i*CHUNK), CHUNK, &purged);
+		int tmp_purged = 0;
+		mnovolatile(vaddr + (i*CHUNK), CHUNK, &tmp_purged);
+		purged |= tmp_purged;
 		i+=2;
 	}
 
